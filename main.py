@@ -21,6 +21,8 @@ from telegram.ext import (
 
 from google import genai
 from google.genai import types
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -85,14 +87,34 @@ def extract_text_from_docx_bytes(docx_bytes: bytes) -> str:
 
 
 def init_google_drive_service() -> Any:
-    """從環境變數安全載入服務帳戶憑證，初始化 Google Drive API v3 客戶端。"""
-    sa_json_str = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not sa_json_str:
-        raise ValueError("環境變數中缺少 GOOGLE_SERVICE_ACCOUNT_JSON 配置。")
-
-    sa_info = json.loads(sa_json_str)
+    """從環境變數載入 Google Drive 憑證，初始化 Google Drive API v3 客戶端。"""
     scopes = ["https://www.googleapis.com/auth/drive"]
-    creds = service_account.Credentials.from_service_account_info(sa_info, scopes=scopes)
+    sa_json_str = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if sa_json_str:
+        sa_info = json.loads(sa_json_str)
+        creds = service_account.Credentials.from_service_account_info(sa_info, scopes=scopes)
+        return build("drive", "v3", credentials=creds)
+
+    client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+    client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+    refresh_token = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN")
+
+    if not client_id or not client_secret or not refresh_token:
+        raise ValueError(
+            "環境變數中缺少 Google Drive 驗證配置。請設定 GOOGLE_SERVICE_ACCOUNT_JSON，"
+            "或改用 GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / "
+            "GOOGLE_OAUTH_REFRESH_TOKEN。"
+        )
+
+    creds = Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=scopes,
+    )
+    creds.refresh(Request())
     return build("drive", "v3", credentials=creds)
 
 
