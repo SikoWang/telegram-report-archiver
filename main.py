@@ -240,8 +240,10 @@ def invoke_gemini_analysis(file_bytes: bytes, mime_type: str, file_name: str) ->
         prompt = f"請對名為 '{file_name}' 的文檔進行全面深度剖析。"
 
         logger.info("發起 Gemini API 結構化分析請求...")
+        gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+        logger.info(f"使用模型: {gemini_model}")
         response = client.models.generate_content(
-            model="gemini-2.5-pro",
+            model=gemini_model,
             contents=[document_part, prompt],
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
