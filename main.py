@@ -5,6 +5,8 @@ import json
 import logging
 import zipfile
 import xml.etree.ElementTree as ET
+import re
+from datetime import datetime
 from typing import Any
 
 # 支援本地開發載入 .env 檔案
@@ -60,6 +62,9 @@ class ReportAnalysis(BaseModel):
     )
     summary: str = Field(
         description="本報告之繁體中文核心摘要，內容須客觀、結構完整且條理清晰，字數嚴格限制在 250 至 300 字之間。"
+    )
+    title: str = Field(
+        description="為本報告擬定之最適繁體中文標題，用於存檔檔名，字數應精簡（不超過 20 字），例如：'2026年度銷售策略分析'。"
     )
 
 
@@ -349,6 +354,99 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
             )
 
 
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """處理直接傳送的純文字報告，自動生成標題與摘要，並以 MD 格式加時間戳記歸檔至 Google Drive。"""
+    global DOWNLOAD_SEMAPHORE
+    if DOWNLOAD_SEMAPHORE is None:
+        DOWNLOAD_SEMAPHORE = asyncio.Semaphore(2)
+
+    message = update.message
+    if not message or not message.text:
+        return
+
+    text_content = message.text.strip()
+    
+    # 過濾過短的訊息（例如小於 15 個字），避免誤判一般對話聊天
+    if len(text_content) < 15:
+        return
+
+    status_msg = await message.reply_text("🧠 收到純文字報告，正在以 Gemini 進行深度分析、分類與擬定標題...")
+
+    async with DOWNLOAD_SEMAPHORE:
+        try:
+            # 將文字轉為 utf-8 bytes 來呼叫 invoke_gemini_analysis
+            file_bytes = text_content.encode("utf-8")
+            file_name_placeholder = "純文字訊息"
+            
+            loop = asyncio.get_event_loop()
+            analysis_result: ReportAnalysis = await loop.run_in_executor(
+                None, invoke_gemini_analysis, file_bytes, "text/plain", file_name_placeholder
+            )
+            
+            category = analysis_result.category
+            summary = analysis_result.summary
+            title = getattr(analysis_result, "title", None) or "未命名報告"
+
+            await status_msg.edit_text(
+                f"🗂️ 分析完成！標題：`{title}`\n歸類為：`{category}`\n正在格式化並歸檔至 Google Drive...",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+            # 產生帶有時間戳記的 MD 檔名
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_title = re.sub(r'[\\/*?:"<>|]', "", title).strip()
+            if len(safe_title) > 50:
+                safe_title = safe_title[:50]
+            if not safe_title:
+                safe_title = "未命名報告"
+            md_filename = f"{safe_title}_{timestamp}.md"
+
+            # 格式化 MD 內容
+            md_content = (
+                f"# {title}\n\n"
+                f"* 📂 **歸檔類別**：`{category}`\n"
+                f"* 📅 **歸檔時間**：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"---\n\n"
+                f"## 📝 智慧摘要\n{summary}\n\n"
+                f"---\n\n"
+                f"## 📋 報告原文\n\n{text_content}\n"
+            )
+            md_bytes = md_content.encode("utf-8")
+
+            # 尋找或建立動態分類資料夾
+            target_folder_id = await loop.run_in_executor(
+                None, get_or_create_category_folder, category, GOOGLE_DRIVE_PARENT_ID
+            )
+            
+            # 上傳並取得共用連結 (MD 檔案的 MIME 類型設為 text/markdown)
+            web_view_link = await loop.run_in_executor(
+                None, upload_and_share_file, md_filename, md_bytes, "text/markdown", target_folder_id
+            )
+
+            response_text = (
+                f"📋 **文字報告自動歸檔摘要**\n\n"
+                f"📌 **報告標題：** `{title}`\n"
+                f"📂 **歸檔類別：** `{category}`\n\n"
+                f"📝 **智慧摘要（約 300 字）：**\n{summary}\n\n"
+                f"🔗 **雲端檔案 (Markdown)：** [點此檢視]({web_view_link})"
+            )
+
+            await status_msg.delete()
+            await message.reply_text(
+                response_text,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
+            logger.info(f"純文字報告 '{md_filename}' 全管線歸檔完成。")
+
+        except Exception as e:
+            logger.error(f"文字訊息歸檔管線異常: {e}", exc_info=True)
+            await status_msg.edit_text(
+                f"💥 管線中斷，異常原因：\n`{str(e)[:200]}`\n\n請重試或聯繫系統管理員。",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """處理 /start 指令，提供歡迎詞與使用說明。"""
     user_name = update.effective_user.first_name if update.effective_user else "使用者"
@@ -414,6 +512,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     application.run_polling()
 
 

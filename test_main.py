@@ -72,6 +72,16 @@ class TestTelegramReportArchiver(unittest.TestCase):
                 mock_logger.critical.assert_called()
                 args, kwargs = mock_logger.critical.call_args
                 self.assertTrue(any("缺少 Google Drive 驗證配置" in arg for arg in args))
+    def test_report_analysis_schema(self):
+        """測試 ReportAnalysis 模型是否包含 category、summary 和 title 欄位。"""
+        analysis = main.ReportAnalysis(
+            category="測試分類",
+            summary="這是一個測試摘要，內容大約有三字。",
+            title="測試標題"
+        )
+        self.assertEqual(analysis.category, "測試分類")
+        self.assertEqual(analysis.summary, "這是一個測試摘要，內容大約有三字。")
+        self.assertEqual(analysis.title, "測試標題")
 
 
 if __name__ == "__main__":
