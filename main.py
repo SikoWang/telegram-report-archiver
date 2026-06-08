@@ -7,6 +7,10 @@ import zipfile
 import xml.etree.ElementTree as ET
 from typing import Any
 
+# 支援本地開發載入 .env 檔案
+from dotenv import load_dotenv
+load_dotenv()
+
 from pydantic import BaseModel, Field
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception_type
 
@@ -17,6 +21,7 @@ from telegram.ext import (
     ContextTypes,
     MessageHandler,
     filters,
+    CommandHandler, # 新增指令處理器支援
 )
 
 from google import genai
@@ -118,7 +123,16 @@ def init_google_drive_service() -> Any:
     return build("drive", "v3", credentials=creds)
 
 
-drive_service = init_google_drive_service()
+# 延遲載入 Google Drive API 服務，防止啟動時因環境變數缺失而直接崩潰
+_drive_service = None
+
+
+def get_drive_service() -> Any:
+    """取得或初始化 Google Drive API 服務 (延遲載入)"""
+    global _drive_service
+    if _drive_service is None:
+        _drive_service = init_google_drive_service()
+    return _drive_service
 
 
 def get_or_create_category_folder(category_name: str, parent_id: str) -> str:
@@ -131,7 +145,8 @@ def get_or_create_category_folder(category_name: str, parent_id: str) -> str:
         f"'{parent_id}' in parents and "
         f"trashed = false"
     )
-    results = drive_service.files().list(q=query, fields="files(id)").execute()
+    drive = get_drive_service()
+    results = drive.files().list(q=query, fields="files(id)").execute()
     files = results.get("files", [])
 
     if files:
@@ -144,7 +159,7 @@ def get_or_create_category_folder(category_name: str, parent_id: str) -> str:
         "mimeType": "application/vnd.google-apps.folder",
         "parents": [parent_id],
     }
-    new_folder = drive_service.files().create(body=folder_metadata, fields="id").execute()
+    new_folder = drive.files().create(body=folder_metadata, fields="id").execute()
     folder_id = new_folder.get("id")
     logger.info(f"動態新建分類子資料夾: '{category_name}' (ID: {folder_id})")
     return folder_id
@@ -156,7 +171,8 @@ def upload_and_share_file(
     """將記憶體字節流上傳至 Google Drive，開啟公開讀取權限，回傳 WebViewLink。"""
     file_metadata = {"name": file_name, "parents": [folder_id]}
     media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=True)
-    uploaded_file = drive_service.files().create(
+    drive = get_drive_service()
+    uploaded_file = drive.files().create(
         body=file_metadata, media_body=media, fields="id, webViewLink"
     ).execute()
 
@@ -164,14 +180,24 @@ def upload_and_share_file(
     logger.info(f"檔案上傳成功，ID: {file_id}")
 
     permission_body = {"role": "reader", "type": "anyone"}
-    drive_service.permissions().create(fileId=file_id, body=permission_body).execute()
+    drive.permissions().create(fileId=file_id, body=permission_body).execute()
     logger.info(f"公開讀取權限設定完成 (ID: {file_id})")
 
-    file_details = drive_service.files().get(fileId=file_id, fields="webViewLink").execute()
+    file_details = drive.files().get(fileId=file_id, fields="webViewLink").execute()
     return file_details.get("webViewLink")
 
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+_gemini_client = None
+
+
+def get_gemini_client() -> genai.Client:
+    """取得或初始化 Gemini API 客戶端 (延遲載入)"""
+    global _gemini_client
+    if _gemini_client is None:
+        if not GEMINI_API_KEY:
+            raise ValueError("缺少 GEMINI_API_KEY 環境變數，無法初始化 Gemini 客戶端。")
+        _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    return _gemini_client
 
 
 @retry(
@@ -191,34 +217,50 @@ def invoke_gemini_analysis(file_bytes: bytes, mime_type: str, file_name: str) ->
         "內容應精確提煉出核心立論、關鍵數據與主要結論。"
     )
 
-    if mime_type == "application/pdf":
-        document_part = types.Part.from_bytes(data=file_bytes, mime_type="application/pdf")
-    elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-        plain_text = extract_text_from_docx_bytes(file_bytes)
-        document_part = types.Part.from_text(text=plain_text)
-    else:
-        try:
-            plain_text = file_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            plain_text = file_bytes.decode("big5", errors="replace")
-        document_part = types.Part.from_text(text=plain_text)
+    uploaded_file = None
+    try:
+        client = get_gemini_client()
+        if mime_type == "application/pdf":
+            logger.info("使用 Files API 上傳 PDF 檔案至 Gemini 以避免 payload 限制...")
+            uploaded_file = client.files.upload(
+                file=io.BytesIO(file_bytes),
+                config=dict(mime_type="application/pdf", display_name=file_name)
+            )
+            document_part = uploaded_file
+        elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            plain_text = extract_text_from_docx_bytes(file_bytes)
+            document_part = types.Part.from_text(text=plain_text)
+        else:
+            try:
+                plain_text = file_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                plain_text = file_bytes.decode("big5", errors="replace")
+            document_part = types.Part.from_text(text=plain_text)
 
-    prompt = f"請對名為 '{file_name}' 的文檔進行全面深度剖析。"
+        prompt = f"請對名為 '{file_name}' 的文檔進行全面深度剖析。"
 
-    logger.info("發起 Gemini API 結構化分析請求...")
-    response = gemini_client.models.generate_content(
-        model="gemini-2.5-pro",
-        contents=[document_part, prompt],
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            response_mime_type="application/json",
-            response_schema=ReportAnalysis,
-            temperature=0.2,
-        ),
-    )
+        logger.info("發起 Gemini API 結構化分析請求...")
+        response = client.models.generate_content(
+            model="gemini-2.5-pro",
+            contents=[document_part, prompt],
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                response_schema=ReportAnalysis,
+                temperature=0.2,
+            ),
+        )
 
-    parsed_result: ReportAnalysis = response.parsed
-    return parsed_result
+        parsed_result: ReportAnalysis = response.parsed
+        return parsed_result
+
+    finally:
+        if uploaded_file is not None:
+            try:
+                logger.info(f"清理 Gemini 上的臨時檔案: {uploaded_file.name}")
+                client.files.delete(name=uploaded_file.name)
+            except Exception as delete_err:
+                logger.warning(f"清理 Gemini 檔案失敗: {delete_err}")
 
 
 async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -301,6 +343,40 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
             )
 
 
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """處理 /start 指令，提供歡迎詞與使用說明。"""
+    user_name = update.effective_user.first_name if update.effective_user else "使用者"
+    welcome_text = (
+        f"👋 您好，{user_name}！我是**智慧型文件分類歸檔機器人**。\n\n"
+        "你可以直接向我發送 PDF、Word (.docx) 或純文字 (.txt) 報告，我將會自動：\n"
+        "1. 🧠 使用 Gemini AI 分析報告內容並自動分類。\n"
+        "2. 📝 生成大約 300 字的繁體中文核心摘要。\n"
+        "3. 📁 自動將報告歸檔至 Google Drive 對應的分類資料夾中。\n"
+        "4. 🔗 回傳公開檢視連結與分析摘要給您。\n\n"
+        "使用 /help 可取得更多說明。"
+    )
+    if update.message:
+        await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """處理 /help 指令，說明限制與格式。"""
+    help_text = (
+        "💡 **使用說明與限制**\n\n"
+        "📌 **支援格式：**\n"
+        "- PDF (`.pdf`)\n"
+        "- Word (`.docx`)\n"
+        "- 純文字 (`.txt`)\n\n"
+        "⚠️ **限制限制：**\n"
+        "- 單一檔案大小上限為 **20 MB**（受限於 Telegram Bot API）。\n"
+        "- 同時僅能處理 2 個任務，其餘任務會排隊等待。\n\n"
+        "🔧 **如何開始：**\n"
+        "直接拖曳或上傳報告檔案到此對話，我便會開始處理。"
+    )
+    if update.message:
+        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+
+
 def main() -> None:
     required_vars = {
         "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
@@ -312,9 +388,25 @@ def main() -> None:
         logger.critical(f"系統啟動失敗：缺少環境變數 {missing}")
         return
 
+    # 進一步檢查 Google Drive 服務所需的憑證變數
+    has_sa = bool(os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"))
+    has_oauth = all([
+        os.environ.get("GOOGLE_OAUTH_CLIENT_ID"),
+        os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET"),
+        os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN")
+    ])
+    if not has_sa and not has_oauth:
+        logger.critical(
+            "系統啟動失敗：缺少 Google Drive 驗證配置。\n"
+            "請設定 GOOGLE_SERVICE_ACCOUNT_JSON，或設定完整的 GOOGLE_OAUTH_* 環境變數。"
+        )
+        return
+
     logger.info("智慧型文件處理 Telegram 機器人啟動中...")
 
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))
     application.run_polling()
 
