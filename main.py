@@ -42,8 +42,8 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GOOGLE_DRIVE_PARENT_ID = os.environ.get("GOOGLE_DRIVE_PARENT_ID")
 
-# 全域異步信號量：限制同時下載/解析任務數量為 2，防止容器 OOM
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(2)
+# 全域異步信號量：限制同時下載/解析任務數量為 2，防止容器 OOM (將在事件迴圈中延遲初始化)
+DOWNLOAD_SEMAPHORE = None
 
 MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
 
@@ -267,6 +267,10 @@ def invoke_gemini_analysis(file_bytes: bytes, mime_type: str, file_name: str) ->
 
 async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """異步 Telegram 訊息處理核心，含信號量流量整形與完整異常處理。"""
+    global DOWNLOAD_SEMAPHORE
+    if DOWNLOAD_SEMAPHORE is None:
+        DOWNLOAD_SEMAPHORE = asyncio.Semaphore(2)
+
     message = update.message
     if not message or not message.document:
         return
